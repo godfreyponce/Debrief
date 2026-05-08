@@ -1,0 +1,49 @@
+{
+  "x_instance": "https://nitter.net",
+  "x_fallbacks": [
+    "https://xcancel.com"
+  ],
+  "people": [
+    {
+      "name": "Andrej Karpathy",
+      "feeds": [
+        {"type": "x", "handle": "karpathy"},
+        {"type": "youtube", "handle": "AndrejKarpathy", "channel_id": "UCYO_jab_esuFRV4b17AJtAw"}
+      ]
+    },
+    {
+      "name": "Theo (t3.gg)",
+      "feeds": [
+        {"type": "youtube", "handle": "t3dotgg", "channel_id": "UCtuO2h6OwDueF7h3p8DYYjQ"},
+        {"type": "x", "handle": "theo"}
+      ]
+    },
+    {
+      "name": "NetworkChuck",
+      "feeds": [
+        {"type": "youtube", "handle": "NetworkChuck", "channel_id": "UCOuGATIAbd2DvzJmUgXn2IQ"},
+        {"type": "x", "handle": "NetworkChuck"}
+      ]
+    },
+    {
+      "name": "Nate Herk",
+      "feeds": [
+        {"type": "youtube", "handle": "NateHerk", "channel_id": "UC2ojq-nuP8ceeHqiroeKhBA"},
+        {"type": "x", "handle": "NateHerk"}
+      ]
+    },
+    {
+      "name": "Elon Musk",
+      "feeds": [
+        {"type": "x", "handle": "elonmusk"}
+      ]
+    },
+    {
+      "name": "Dean Ball",
+      "feeds": [
+        {"type": "blog_rss", "url": "https://www.hyperdimensional.co/feed"},
+        {"type": "x", "handle": "deanwball"}
+      ]
+    }
+  ]
+}
