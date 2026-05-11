@@ -23,7 +23,7 @@ import zoneinfo
 PEOPLE = [
     ("Andrej Karpathy", [
         ("x", "karpathy"),
-        ("youtube", "UCYO_jab_esuFRV4b17AJtAw"),
+        ("youtube", "UCPk8m_r6fkUSYmvgCBwq-sw"),
     ]),
     ("Theo (t3.gg)", [
         ("youtube", "UCtuO2h6OwDueF7h3p8DYYjQ"),
@@ -46,9 +46,23 @@ PEOPLE = [
     ]),
 ]
 
-X_INSTANCES = ["https://nitter.net", "https://xcancel.com"]
+X_INSTANCES = [
+    "https://nitter.net",
+    "https://nitter.privacydev.net",
+    "https://nitter.poast.org",
+    "https://nitter.tiekoetter.com",
+    "https://xcancel.com",
+]
 FETCH_TIMEOUT = 6  # seconds per feed
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+# xcancel returns a poisoned "RSS reader not yet whitelisted" feed that passes
+# naive XML checks. Reject any X feed that smells like that gate.
+X_GATE_MARKERS = (
+    "rss reader not yet whitelist",
+    "01 january 1971",
+    "01 jan 1971",
+)
 
 
 # ----- Fetch ------------------------------------------------------------------
@@ -81,14 +95,18 @@ def fetch_feed(kind, key):
                 text = http_get(f"{base}/{key}/rss")
                 text = _clean_xml(text)
                 if not text:
-                    last_err = f"{base}: empty response"
+                    last_err = f"{base.split('//')[1]}: empty"
                     continue
                 if not _looks_like_feed(text):
-                    last_err = f"{base}: non-RSS response (account blocked or rate-limited)"
+                    last_err = f"{base.split('//')[1]}: non-RSS (blocked/anti-bot)"
+                    continue
+                low = text[:4096].lower()
+                if any(m in low for m in X_GATE_MARKERS):
+                    last_err = f"{base.split('//')[1]}: gated (whitelist required)"
                     continue
                 return text, None
             except Exception as e:
-                last_err = f"{base}: {type(e).__name__}"
+                last_err = f"{base.split('//')[1]}: {type(e).__name__}"
                 continue
         return None, last_err
     if kind == "youtube":
@@ -137,11 +155,14 @@ def strip_tags(s):
 
 
 def parse_xml(text, kind, window_start, now_utc):
+    """Returns (items_in_window, total_items_seen, latest_dt_utc, error)."""
     try:
         root = ET.fromstring(text)
     except Exception as e:
-        return None, f"parse error: {e}"
+        return None, 0, None, f"parse error: {e}"
     items = []
+    total = 0
+    latest = None
     if kind in ("x", "blog"):
         for item in root.iter("item"):
             t = item.findtext("title") or ""
@@ -152,6 +173,9 @@ def parse_xml(text, kind, window_start, now_utc):
                 continue
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
+            total += 1
+            if latest is None or dt > latest:
+                latest = dt
             if window_start <= dt <= now_utc:
                 items.append({"title": strip_tags(t), "link": link, "dt": dt})
     elif kind == "youtube":
@@ -166,9 +190,12 @@ def parse_xml(text, kind, window_start, now_utc):
                 continue
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
+            total += 1
+            if latest is None or dt > latest:
+                latest = dt
             if window_start <= dt <= now_utc:
                 items.append({"title": strip_tags(t), "link": link, "dt": dt})
-    return items, None
+    return items, total, latest, None
 
 
 # ----- Render -----------------------------------------------------------------
@@ -343,14 +370,26 @@ def render(results, now_utc):
         for kind, err in r["errors"]:
             _, label = PILL_LABEL.get(kind, ("pill-x", kind))
             items_html.append(
-                f'      <li class="error" style="grid-column: 1/-1;">[fetch error in {esc(label)}: {esc(err)}]</li>'
+                f'      <li class="error" style="grid-column: 1/-1;">[{esc(label)} unavailable — {esc(err)}]</li>'
             )
 
         count = len(r["items"])
+        has_errors = bool(r["errors"])
         if items_html:
+            count_label = (
+                f'{count} item{"s" if count != 1 else ""}'
+                if count > 0 else
+                "no items"
+            )
             body = (
-                f'    <h2>{esc(r["name"])} <span class="count">{count} item{"s" if count != 1 else ""}</span></h2>\n'
+                f'    <h2>{esc(r["name"])} <span class="count">{esc(count_label)}</span></h2>\n'
                 "    <ul>\n" + "\n".join(items_html) + "\n    </ul>"
+            )
+        elif has_errors:
+            # All this person's feeds errored — tell the user that, don't pretend they were quiet.
+            body = (
+                f'    <h2>{esc(r["name"])} <span class="count">unreachable</span></h2>\n'
+                f'    <p class="empty">All feeds for this person are unreachable right now.</p>'
             )
         else:
             body = f'    <h2>{esc(r["name"])}</h2>\n    <p class="empty">Nothing new in the last 24h.</p>'
@@ -419,31 +458,108 @@ def assemble(now_utc, fetched):
     window_start = now_utc - timedelta(hours=24)
     out = []
     for name, feeds in PEOPLE:
-        items, errors = [], []
+        items, errors, diagnostics = [], [], []
         for kind, key in feeds:
             text, err = fetched.get((kind, key), (None, "missing"))
             if err is not None:
                 errors.append((kind, err))
+                diagnostics.append({"kind": kind, "key": key, "error": err,
+                                    "total_items": 0, "in_window": 0, "latest": None})
                 continue
-            parsed, perr = parse_xml(text, kind, window_start, now_utc)
+            parsed, total, latest, perr = parse_xml(text, kind, window_start, now_utc)
+            latest_iso = latest.isoformat() if latest else None
             if perr is not None:
                 errors.append((kind, perr))
-            else:
-                for it in parsed:
-                    items.append({**it, "kind": kind})
+                diagnostics.append({"kind": kind, "key": key, "error": perr,
+                                    "total_items": total, "in_window": 0, "latest": latest_iso})
+                continue
+            for it in parsed:
+                items.append({**it, "kind": kind})
+            # Surface "fetched feed parsed cleanly but had zero items at all" as a soft error.
+            # That's almost always an upstream issue (account blocked, mirror gated) rather than
+            # a real "person had nothing to say". A real quiet account still has historical items.
+            if total == 0:
+                errors.append((kind, "feed parsed but contained 0 items"))
+            diagnostics.append({"kind": kind, "key": key, "error": None,
+                                "total_items": total, "in_window": len(parsed),
+                                "latest": latest_iso})
         items.sort(key=lambda x: x["dt"], reverse=True)
-        out.append({"name": name, "items": items, "errors": errors})
+        out.append({"name": name, "items": items, "errors": errors,
+                    "diagnostics": diagnostics})
     return out
 
 
 # ----- Vercel handler ---------------------------------------------------------
 
 class handler(BaseHTTPRequestHandler):
+    @staticmethod
+    def _probe_one(url):
+        out = {"url": url}
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                body = resp.read(8192)
+                out["status"] = resp.status
+                out["bytes"] = len(body)
+                txt = body.decode("utf-8", errors="replace")
+                out["sample"] = txt[:240]
+                out["looks_feed"] = _looks_like_feed(txt)
+                out["item_count"] = txt.lower().count("<item>") + txt.lower().count("<entry")
+                out["gated"] = any(m in txt[:4096].lower() for m in X_GATE_MARKERS)
+        except Exception as e:
+            out["error"] = f"{type(e).__name__}: {e}"
+        return out
+
     def do_GET(self):
         try:
             now_utc = datetime.now(timezone.utc)
+            # ?probe=<url1>,<url2>,... — fetches each from Vercel's IP and returns
+            # head/status/size/sample so we can find sources that work from here.
+            path = self.path or ""
+            if "probe=" in path:
+                from urllib.parse import urlparse, parse_qs
+                import json
+                qs = parse_qs(urlparse(path).query)
+                urls = qs.get("probe", [""])[0].split(",")
+                urls = [u for u in (u.strip() for u in urls) if u]
+                results_p = []
+                with ThreadPoolExecutor(max_workers=min(8, max(1, len(urls)))) as ex:
+                    futs = {ex.submit(self._probe_one, u): u for u in urls}
+                    for fut in as_completed(futs):
+                        results_p.append(fut.result())
+                body = json.dumps(results_p, indent=2).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             fetched = gather()
             results = assemble(now_utc, fetched)
+            is_debug = "debug=1" in path
+            if is_debug:
+                import json
+                payload = {
+                    "now_utc": now_utc.isoformat(),
+                    "people": [
+                        {
+                            "name": r["name"],
+                            "items_in_window": len(r["items"]),
+                            "errors": [{"kind": k, "error": e} for k, e in r["errors"]],
+                            "diagnostics": r["diagnostics"],
+                        }
+                        for r in results
+                    ],
+                }
+                body = json.dumps(payload, indent=2).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             html = render(results, now_utc)
             body = html.encode("utf-8")
 
