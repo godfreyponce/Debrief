@@ -14,6 +14,9 @@ from email.utils import parsedate_to_datetime
 import urllib.request
 import xml.etree.ElementTree as ET
 import re
+import json
+import os
+import time
 import html as htmllib
 import zoneinfo
 
@@ -46,13 +49,16 @@ PEOPLE = [
     ]),
 ]
 
-X_INSTANCES = [
-    "https://nitter.net",
-    "https://nitter.privacydev.net",
-    "https://nitter.poast.org",
-    "https://nitter.tiekoetter.com",
-    "https://xcancel.com",
-]
+# X's embed backend (what "embed a timeline" widgets load). Reachable from Vercel
+# without login, but it serves X's *highlights* for an account — not a chronological
+# timeline. Retweets are absent and most small posts never appear.
+X_SYNDICATION = "https://syndication.twitter.com/srv/timeline-profile/screen-name/{handle}"
+# The embed backend allows 30 requests per ~15 min per IP (x-rate-limit-limit header),
+# and a page view would cost 6. So X is fetched into a Vercel Blob at most every
+# X_CACHE_TTL and page views read the blob. TTL is a guess: highlights change rarely.
+X_CACHE_URL = "https://g3ddkievigmdunii.public.blob.vercel-storage.com/x-highlights.json"
+X_CACHE_TTL = timedelta(hours=6)
+X_RETRY_AFTER = timedelta(minutes=15)  # X's observed rate-limit window
 FETCH_TIMEOUT = 6  # seconds per feed
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
@@ -86,29 +92,88 @@ def _clean_xml(text):
     return text.lstrip()
 
 
+def fetch_x_highlights(handle):
+    """Returns (tweets, error). tweets: [{"id_str", "created_at", "full_text"}]."""
+    try:
+        text = http_get(X_SYNDICATION.format(handle=handle))
+    except Exception as e:
+        return None, f"x embed backend: {type(e).__name__}: {e}"
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', text, re.S)
+    if not m:
+        return None, "x embed backend: no __NEXT_DATA__ in response"
+    try:
+        entries = json.loads(m.group(1))["props"]["pageProps"]["timeline"]["entries"]
+    except Exception as e:
+        return None, f"x embed backend: parse error: {type(e).__name__}: {e}"
+    tweets = []
+    for entry in entries:
+        t = entry.get("content", {}).get("tweet")
+        if t and "id_str" in t and "created_at" in t:
+            tweets.append({"id_str": t["id_str"], "created_at": t["created_at"],
+                           "full_text": t.get("full_text", "")})
+    return tweets, None
+
+
+def load_x_cache():
+    try:
+        return json.loads(http_get(f"{X_CACHE_URL}?t={int(datetime.now().timestamp())}"))
+    except Exception:
+        return None
+
+
+def save_x_cache(cache):
+    token = os.environ.get("BLOB_READ_WRITE_TOKEN")
+    if not token:
+        return "BLOB_READ_WRITE_TOKEN not set"
+    req = urllib.request.Request(
+        "https://blob.vercel-storage.com/x-highlights.json",
+        data=json.dumps(cache).encode("utf-8"), method="PUT",
+        headers={"authorization": f"Bearer {token}", "x-api-version": "7",
+                 "x-content-type": "application/json", "x-add-random-suffix": "0",
+                 "x-allow-overwrite": "1", "x-cache-control-max-age": "60"})
+    try:
+        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT):
+            return None
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
+def x_highlights(handles, now_utc):
+    """Returns (dict handle -> (tweets, error), meta). Serves the blob cache when it is
+    fresh; otherwise refreshes from X, keeping each handle's last good data on failure."""
+    cache = load_x_cache() or {"attempted_at": None, "feeds": {}, "errors": {}}
+    feeds, errors = cache.get("feeds", {}), cache.get("errors", {})
+    attempted = parse_dt(cache["attempted_at"]) if cache.get("attempted_at") else None
+    missing = [h for h in handles if h not in feeds]
+    max_age = X_RETRY_AFTER if (errors or missing) else X_CACHE_TTL
+    meta = {"attempted_at": cache.get("attempted_at"), "served_from": "cache", "save_error": None}
+    if attempted is None or now_utc - attempted > max_age:
+        # Sequential on purpose: a parallel burst of 6 got 429 while sequential
+        # requests passed, so the embed backend also limits concurrency.
+        errors = {}
+        for h in handles:
+            tweets, err = fetch_x_highlights(h)
+            time.sleep(0.5)
+            if err is None:
+                feeds[h] = {"fetched_at": now_utc.isoformat(), "tweets": tweets}
+            else:
+                errors[h] = err
+        cache = {"attempted_at": now_utc.isoformat(), "feeds": feeds, "errors": errors}
+        meta = {"attempted_at": cache["attempted_at"], "served_from": "refresh",
+                "save_error": save_x_cache(cache)}
+    out = {}
+    for h in handles:
+        if h in feeds:
+            out[h] = (feeds[h], None)
+        else:
+            out[h] = (None, errors.get(h, "not fetched yet"))
+    meta["errors"] = errors
+    meta["oldest_fetched_at"] = min((f["fetched_at"] for f in feeds.values()), default=None)
+    return out, meta
+
+
 def fetch_feed(kind, key):
     """Returns (xml_text, error). On success error is None."""
-    if kind == "x":
-        last_err = "no instances tried"
-        for base in X_INSTANCES:
-            try:
-                text = http_get(f"{base}/{key}/rss")
-                text = _clean_xml(text)
-                if not text:
-                    last_err = f"{base.split('//')[1]}: empty"
-                    continue
-                if not _looks_like_feed(text):
-                    last_err = f"{base.split('//')[1]}: non-RSS (blocked/anti-bot)"
-                    continue
-                low = text[:4096].lower()
-                if any(m in low for m in X_GATE_MARKERS):
-                    last_err = f"{base.split('//')[1]}: gated (whitelist required)"
-                    continue
-                return text, None
-            except Exception as e:
-                last_err = f"{base.split('//')[1]}: {type(e).__name__}"
-                continue
-        return None, last_err
     if kind == "youtube":
         try:
             text = http_get(f"https://www.youtube.com/feeds/videos.xml?channel_id={key}")
@@ -154,6 +219,26 @@ def strip_tags(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+def parse_x_highlights(feed, handle, window_start, now_utc):
+    """Returns (items_in_window, total_items_seen, latest_dt_utc, error)."""
+    items, total, latest = [], 0, None
+    for tweet in feed["tweets"]:
+        try:
+            dt = datetime.strptime(tweet["created_at"], "%a %b %d %H:%M:%S %z %Y")
+        except (KeyError, ValueError):
+            continue
+        total += 1
+        if latest is None or dt > latest:
+            latest = dt
+        if window_start <= dt <= now_utc:
+            items.append({
+                "title": " ".join(htmllib.unescape(tweet.get("full_text", "")).split()),
+                "link": f"https://x.com/{handle}/status/{tweet['id_str']}",
+                "dt": dt,
+            })
+    return items, total, latest, None
+
+
 def parse_xml(text, kind, window_start, now_utc):
     """Returns (items_in_window, total_items_seen, latest_dt_utc, error)."""
     try:
@@ -163,7 +248,7 @@ def parse_xml(text, kind, window_start, now_utc):
     items = []
     total = 0
     latest = None
-    if kind in ("x", "blog"):
+    if kind == "blog":
         for item in root.iter("item"):
             t = item.findtext("title") or ""
             link = (item.findtext("link") or "").strip()
@@ -202,7 +287,7 @@ def parse_xml(text, kind, window_start, now_utc):
 
 CT = zoneinfo.ZoneInfo("America/Chicago")
 
-PILL_LABEL = {"x": ("pill-x", "X"), "youtube": ("pill-yt", "YouTube"), "blog": ("pill-blog", "Blog")}
+PILL_LABEL = {"x": ("pill-x", "X highlights"), "youtube": ("pill-yt", "YouTube"), "blog": ("pill-blog", "Blog")}
 
 YT_SVG = ('<svg class="yt-logo" viewBox="0 0 28 20" aria-hidden="true" focusable="false">'
           '<rect width="28" height="20" rx="5.5" ry="5.5" fill="#FF0033"/>'
@@ -345,8 +430,11 @@ def render_dest(label_key, href):
     return f'<a class="dest" href="{esc(href)}" aria-label="{esc(aria)}">{sym}</a>'
 
 
-def render(results, now_utc):
+def render(results, now_utc, x_meta):
     now_ct = now_utc.astimezone(CT)
+    x_fetched = parse_dt(x_meta.get("oldest_fetched_at") or "")
+    x_age = relative(x_fetched, now_utc) if x_fetched else None
+    x_note = f" X highlights last fetched {'just now' if x_age == 'now' else x_age + ' ago'}." if x_age else ""
     date_str = now_ct.strftime("%A, %B ") + str(now_ct.day)
     footer_time = f"Last updated {part_of_day(now_ct.hour)} {fmt_time(now_ct)} CT"
 
@@ -392,7 +480,7 @@ def render(results, now_utc):
                 f'    <p class="empty">All feeds for this person are unreachable right now.</p>'
             )
         else:
-            body = f'    <h2>{esc(r["name"])}</h2>\n    <p class="empty">Nothing new in the last 24h.</p>'
+            body = f'    <h2>{esc(r["name"])}</h2>\n    <p class="empty">Nothing new.</p>'
         sections.append(f'  <section style="--i:{idx}">\n{body}\n  </section>')
 
     return f"""<!doctype html>
@@ -410,7 +498,7 @@ def render(results, now_utc):
   <header class="masthead">
     <p class="eyebrow">Daily Debrief</p>
     <h1>{esc(date_str)}</h1>
-    <p class="sub">Last 24h across six tracked feeds — short clips, offhand tweets, and posts you might otherwise miss.</p>
+    <p class="sub">Last 24h across six tracked people, plus this week's X highlights — short clips, offhand tweets, and posts you might otherwise miss.</p>
     <button id="refresh-btn" class="refresh" type="button" aria-label="Refresh now">
       <span class="spin">↻</span> <span class="label">Refresh</span>
     </button>
@@ -420,7 +508,7 @@ def render(results, now_utc):
   </main>
   <footer>
     <div>{esc(footer_time)}.</div>
-    <div class="line2">Items shown: posts from the last 24 hours.</div>
+    <div class="line2">Items shown: YouTube and blog posts from the last 24 hours; X highlights from the last 7 days, as exposed by X for embedding, not the full timeline.{esc(x_note)}</div>
   </footer>
   <script>
 {REFRESH_JS}
@@ -432,8 +520,8 @@ def render(results, now_utc):
 
 # ----- Orchestrate ------------------------------------------------------------
 
-def gather():
-    """Fetch every (kind, key) in parallel, return dict (kind, key) -> (text, err)."""
+def gather(now_utc):
+    """Fetch every (kind, key) in parallel. Returns (dict (kind, key) -> (payload, err), x_meta)."""
     targets = []
     seen = set()
     for _, feeds in PEOPLE:
@@ -441,21 +529,32 @@ def gather():
             if (kind, key) not in seen:
                 seen.add((kind, key))
                 targets.append((kind, key))
+    x_handles = [key for kind, key in targets if kind == "x"]
 
     results = {}
     with ThreadPoolExecutor(max_workers=12) as ex:
-        future_to_target = {ex.submit(fetch_feed, k, v): (k, v) for k, v in targets}
+        x_future = ex.submit(x_highlights, x_handles, now_utc)
+        future_to_target = {ex.submit(fetch_feed, k, v): (k, v) for k, v in targets if k != "x"}
         for fut in as_completed(future_to_target):
             target = future_to_target[fut]
             try:
                 results[target] = fut.result()
             except Exception as e:
                 results[target] = (None, f"{type(e).__name__}: {e}")
-    return results
+        try:
+            x_results, x_meta = x_future.result()
+        except Exception as e:
+            x_results, x_meta = {h: (None, f"{type(e).__name__}: {e}") for h in x_handles}, {"error": str(e)}
+    for h, res in x_results.items():
+        results[("x", h)] = res
+    return results, x_meta
 
 
 def assemble(now_utc, fetched):
     window_start = now_utc - timedelta(hours=24)
+    # X's highlights feed surfaces only a few posts a week, so a 24h window would
+    # leave it empty most days.
+    x_window_start = now_utc - timedelta(days=7)
     out = []
     for name, feeds in PEOPLE:
         items, errors, diagnostics = [], [], []
@@ -466,7 +565,10 @@ def assemble(now_utc, fetched):
                 diagnostics.append({"kind": kind, "key": key, "error": err,
                                     "total_items": 0, "in_window": 0, "latest": None})
                 continue
-            parsed, total, latest, perr = parse_xml(text, kind, window_start, now_utc)
+            if kind == "x":
+                parsed, total, latest, perr = parse_x_highlights(text, key, x_window_start, now_utc)
+            else:
+                parsed, total, latest, perr = parse_xml(text, kind, window_start, now_utc)
             latest_iso = latest.isoformat() if latest else None
             if perr is not None:
                 errors.append((kind, perr))
@@ -493,13 +595,15 @@ def assemble(now_utc, fetched):
 
 class handler(BaseHTTPRequestHandler):
     @staticmethod
-    def _probe_one(url):
+    def _probe_one(url, raw=False):
         out = {"url": url}
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=8) as resp:
-                body = resp.read(8192)
+                body = resp.read(1_000_000 if raw else 8192)
                 out["status"] = resp.status
+                if raw:
+                    out["raw"] = body.decode("utf-8", errors="replace")
                 out["bytes"] = len(body)
                 txt = body.decode("utf-8", errors="replace")
                 out["sample"] = txt[:240]
@@ -524,7 +628,8 @@ class handler(BaseHTTPRequestHandler):
                 urls = [u for u in (u.strip() for u in urls) if u]
                 results_p = []
                 with ThreadPoolExecutor(max_workers=min(8, max(1, len(urls)))) as ex:
-                    futs = {ex.submit(self._probe_one, u): u for u in urls}
+                    raw = "raw=1" in path
+                    futs = {ex.submit(self._probe_one, u, raw): u for u in urls}
                     for fut in as_completed(futs):
                         results_p.append(fut.result())
                 body = json.dumps(results_p, indent=2).encode("utf-8")
@@ -535,13 +640,14 @@ class handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            fetched = gather()
+            fetched, x_meta = gather(now_utc)
             results = assemble(now_utc, fetched)
             is_debug = "debug=1" in path
             if is_debug:
                 import json
                 payload = {
                     "now_utc": now_utc.isoformat(),
+                    "x_cache": x_meta,
                     "people": [
                         {
                             "name": r["name"],
@@ -560,7 +666,7 @@ class handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            html = render(results, now_utc)
+            html = render(results, now_utc, x_meta)
             body = html.encode("utf-8")
 
             self.send_response(200)
