@@ -8,7 +8,7 @@ A personal "morning paper": a single page that shows what six tracked people pos
 
 Every page load runs a Vercel Python serverless function that fetches the YouTube and Substack feeds in parallel, parses RSS/Atom XML, filters them to the last 24 hours, adds the X highlights cached in Vercel Blob with their seven-day window, and renders the editorial HTML on the fly. The CDN caches the response for 5 minutes (with stale-while-revalidate up to 15 minutes), so most visits are instant.
 
-A `Refresh` button in the masthead bypasses the CDN cache (via `?t=<timestamp>`) and swaps fresh content into the DOM in place — no full page reload.
+A `Refresh` button in the masthead bypasses the CDN cache (via `?t=<timestamp>`) and swaps fresh content into the DOM in place, with no full page reload.
 
 ```
 Visitor → /  →  rewrite to /api/news  →  Python function
@@ -63,8 +63,8 @@ Editorial / Notion-Linear minimalism, applied via the [`taste-skill`](https://gi
 
 The frozen template (CSS + per-item HTML) lives in two places that must stay in sync:
 
-1. **`out/api/news.py`** — the function. Source of truth for what's served.
-2. **`~/.claude/commands/daily-news-debrief.md`** — the Claude Code slash command, kept around for manual rebuilds and as documentation.
+1. **`out/api/news.py`**: the function. Source of truth for what's served.
+2. **`~/.claude/commands/daily-news-debrief.md`**: the Claude Code slash command, kept around for manual rebuilds and as documentation.
 
 If you change the design, update both.
 
@@ -81,9 +81,9 @@ Requires `vercel` CLI logged in. The script bakes in `--scope godfreyps-projects
 
 Edit the `PEOPLE` list in `out/api/news.py`. Each entry is `(name, [(kind, key), ...])`:
 
-- `("x", "<handle>")` — Twitter/X handle without the `@`
-- `("youtube", "<channel_id>")` — must be the `UC…` channel ID, not the @handle
-- `("blog", "<full RSS URL>")` — for Substack and similar
+- `("x", "<handle>")`: Twitter/X handle without the `@`
+- `("youtube", "<channel_id>")`: must be the `UC…` channel ID, not the @handle
+- `("blog", "<full RSS URL>")`: for Substack and similar
 
 To resolve a YouTube `@handle` to a channel ID:
 ```bash
