@@ -1,19 +1,19 @@
 # news-debrief
 
-A personal "morning paper": a single page that shows what six tracked people posted in the last 24 hours across X, YouTube, and one Substack — short clips, offhand tweets, replies, and posts you might otherwise miss. Built around the explicit rule: **keep the small details, don't filter for "substantive" content.**
+A personal "morning paper": a single page that shows what six tracked people posted in the last 24 hours on YouTube and one Substack, plus their X highlights from the last seven days: short clips, offhand tweets, replies, and posts you might otherwise miss. Built around the explicit rule: **keep the small details, don't filter for "substantive" content.**
 
 **Live URL:** https://out-mu-pink.vercel.app
 
 ## How it works
 
-Every page load runs a Vercel Python serverless function that fetches the feeds in parallel, parses RSS/Atom XML, filters to the last 24 hours, and renders the editorial HTML on the fly. The CDN caches the response for 5 minutes (with stale-while-revalidate up to 15 minutes), so most visits are instant.
+Every page load runs a Vercel Python serverless function that fetches the YouTube and Substack feeds in parallel, parses RSS/Atom XML, filters them to the last 24 hours, adds the X highlights cached in Vercel Blob with their seven-day window, and renders the editorial HTML on the fly. The CDN caches the response for 5 minutes (with stale-while-revalidate up to 15 minutes), so most visits are instant.
 
 A `Refresh` button in the masthead bypasses the CDN cache (via `?t=<timestamp>`) and swaps fresh content into the DOM in place — no full page reload.
 
 ```
 Visitor → /  →  rewrite to /api/news  →  Python function
-                                          ├─ parallel-fetch 11 feeds
-                                          ├─ filter to last 24h
+                                          ├─ parallel-fetch 5 YouTube and Substack feeds, keep last 24h
+                                          ├─ read X highlights from Vercel Blob, keep last 7 days
                                           ├─ render HTML
                                           └─ return with Cache-Control
 ```
@@ -31,12 +31,12 @@ Configured in `api/news.py` (the `PEOPLE` constant). Channel IDs are pre-resolve
 | Elon Musk       | X (`@elonmusk`)                       |
 | Dean Ball       | Substack RSS, X (`@deanwball`)        |
 
-X feeds use Nitter (`https://nitter.net/{handle}/rss`) with `xcancel.com` as fallback. YouTube uses the Atom endpoint `https://www.youtube.com/feeds/videos.xml?channel_id={id}`. Dean Ball's blog uses his Substack feed directly.
+X comes from X's own embed backend, highlights only, cached 6 hours in a Vercel Blob, because every free bridge died. YouTube uses the Atom endpoint `https://www.youtube.com/feeds/videos.xml?channel_id={id}`. Dean Ball's blog uses his Substack feed directly.
 
 ## File layout
 
 ```
-~/Desktop/newsDebrief/
+./
 ├── README.md            # this file
 ├── deploy.sh            # `vercel deploy out --prod --yes --scope godfreyps-projects`
 ├── sources.json         # legacy: kept for reference; function has its own PEOPLE list
@@ -71,7 +71,7 @@ If you change the design, update both.
 ## Deploying
 
 ```bash
-cd ~/Desktop/newsDebrief
+# from the repo root
 bash deploy.sh
 ```
 
@@ -92,16 +92,12 @@ curl -sL "https://www.youtube.com/@<handle>" | grep -oE '"channelId":"UC[A-Za-z0
 
 Mirror the change in `~/.claude/commands/daily-news-debrief.md` so manual runs match.
 
-## The 8am ritual (planned)
-
-A `/schedule` skill routine fires daily at 8am CT (`0 8 * * *` `America/Chicago`). The routine pings the live URL with cache-busting so the morning's first visit is fresh, and serves as a daily reminder. *(Not wired up yet — see Task #6.)*
-
 ## Known issues / caveats
 
-- **X-RSS reliability is bad in 2026.** RSSHub (`rsshub.app`) is gone (returns Google 404). Nitter (`nitter.net`) returns valid RSS for some handles and empty/200 or HTML errors for others, varying by IP. `xcancel.com` periodically 403s. The function falls through both providers and renders a per-person fetch-error row when both fail; the rest of the page keeps working.
+- **X supplies highlights, not a complete timeline.** The page shows a seven-day window.
 - **YouTube RSS endpoint is intermittent.** Has 404'd for all channel IDs simultaneously across the entire RSS service at least once. When this happens, every YouTube section renders a fetch-error row.
 - **24h window is recompute-on-render.** The function uses `now - 24h`, so if you visit at 8am CT and again at 6pm, the windows are different (and items can roll out of frame).
-- **No persistence.** The function doesn't store anything — every render is fresh from the source feeds. There's no archive of past mornings.
+- **No archive.** X highlights are cached in Vercel Blob. There is no archive of past mornings.
 - **Hobby-tier serverless.** 10s timeout per invocation. Parallel fetch with 6s per-feed timeout keeps total under 7s in practice.
 
 ## Origin
